@@ -1,0 +1,19 @@
+{
+  "name": "Machenike K500-M81",
+  "firmware": "V1_13_00",
+  "vid": "0x0416",
+  "pid": "0x7372",
+  "interface_marker": "&mi_02#",
+  "report_length": 64,
+  "lighting_prefix": "01 07 00 00 00 0E",
+  "notes": "Captured from a K500-M81 on firmware V1_13_00 with the official Machenike driver. Bytes after the command body are driver padding; the two tail bytes are retained exactly as observed.",
+  "packets": {
+    "baseline":       ["01 07 00 00 00 0E 06 02 02 00 FF AA", "5E BC"],
+    "codex_working":  ["01 07 00 00 00 0E 0F 02 02 00 00 FF 00 00 00 06 00", "40 26"],
+    "claude_working": ["01 07 00 00 00 0E 0F 02 02 FF 55 00 00 00 00 06 00", "E7 7B"],
+    "success":        ["01 07 00 00 00 0E 00 02 02 00 FF 00", "C3 DF"],
+    "permission":     ["01 07 00 00 00 0E 01 04 02 AA 00 FF", "45 17"],
+    "error":          ["01 07 00 00 00 0E 00 02 02 FF 00 00", "CC E7"],
+    "off":            ["01 07 00 00 00 0E 00 02 02 00 00 00", "1B 96"]
+  }
+}
