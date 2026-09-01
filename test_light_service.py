@@ -15,6 +15,7 @@ import tempfile
 import unittest
 import uuid
 
+import light_backends
 import light_client
 import light_service
 from light_service import (
@@ -406,6 +407,60 @@ class HidFailureReportingTest(unittest.TestCase):
         self.assertEqual(r.consecutive_failures, 0)
         self.assertIsNone(r.last_error)
         self.assertTrue(any("recovered" in m for m in logged))
+
+
+class BackendTest(unittest.TestCase):
+    """The semantic table must describe the real captured bytes, not a
+    parallel invented vocabulary -- otherwise a second backend would render
+    something subtly different from what this keyboard has always shown."""
+
+    def test_semantics_match_the_captured_packets(self):
+        import keyboard_lights as kl
+        for name, (animation, rgb) in light_backends.EFFECT_SEMANTICS.items():
+            packet = kl.DEVICE.packets[name]
+            self.assertEqual(
+                (packet[9], packet[10], packet[11]), rgb,
+                f"{name}: semantic colour disagrees with the captured packet",
+            )
+            self.assertIn(animation, light_backends.ANIMATIONS)
+
+    def test_every_required_effect_has_semantics(self):
+        import keyboard_lights as kl
+        self.assertEqual(
+            set(light_backends.EFFECT_SEMANTICS), set(kl.REQUIRED_EFFECTS)
+        )
+
+    def test_captured_backend_is_preferred_when_present(self):
+        class FakeKL:
+            DEVICE = type("D", (), {"name": "x", "hid_id": "y", "packets": {}})()
+            @staticmethod
+            def device_present(): return True
+            @staticmethod
+            def send_packet(_p): pass
+        backend, notes = light_backends.resolve_backend(FakeKL())
+        self.assertEqual(backend.name, "captured")
+        self.assertTrue(any("available" in n for n in notes))
+
+    def test_no_backend_when_nothing_is_drivable(self):
+        class FakeKL:
+            DEVICE = type("D", (), {"name": "x", "hid_id": "y", "packets": {}})()
+            @staticmethod
+            def device_present(): return False
+        backend, notes = light_backends.resolve_backend(FakeKL())
+        self.assertIsNone(backend)
+        self.assertTrue(any("not available" in n for n in notes))
+
+    def test_captured_backend_sends_the_exact_bytes(self):
+        sent = []
+        class FakeKL:
+            DEVICE = type("D", (), {"name": "x", "hid_id": "y",
+                                    "packets": {"success": b"rest"}})()
+            @staticmethod
+            def device_present(): return True
+            @staticmethod
+            def send_packet(p): sent.append(p)
+        light_backends.CapturedBackend(FakeKL()).send("success")
+        self.assertEqual(sent, [b"rest"])
 
 
 if __name__ == "__main__":

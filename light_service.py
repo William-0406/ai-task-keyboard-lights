@@ -21,6 +21,7 @@ import sys
 import time
 from typing import Any, Callable
 
+import light_backends
 from light_client import APP_DIR, EVENTS_FILE
 
 SERVICE_LOG = APP_DIR / "service.log"
@@ -597,6 +598,7 @@ def _health(kl: Any, renderer: "Renderer") -> dict[str, Any]:
     return {
         "device": kl.DEVICE.key,
         "device_name": kl.DEVICE.name,
+        "backend": getattr(renderer, "backend_name", None),
         "device_present": kl.device_present(),
         "hid_failures": renderer.consecutive_failures,
         "hid_last_error": renderer.last_error,
@@ -626,12 +628,24 @@ def run_service(
         stop_signal = StopSignal()
         stop_check = stop_signal.is_set
 
+    backend, notes = light_backends.resolve_backend(kl)
+    for note in notes:
+        report(f"backend {note}")
+    if backend is None:
+        report(
+            "WARNING: no usable lighting backend on this machine. The service "
+            "will keep running and re-check, but nothing can light up until a "
+            "keyboard matching a profile in devices/ is present."
+        )
+
     def send(packet_name: str) -> None:
-        kl.send_packet(kl.DEVICE.packets[packet_name])
+        active = backend or light_backends.CapturedBackend(kl)
+        active.send(packet_name)
 
     machine = StateMachine()
     tail = EventTail(EVENTS_FILE, report)
     renderer = Renderer(send, report)
+    renderer.backend_name = backend.name if backend else None
     started_at = time.time()
     report(f"service started pid={os.getpid()} device={kl.DEVICE.key}")
     present = kl.device_present()
