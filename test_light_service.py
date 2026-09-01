@@ -22,6 +22,7 @@ from light_service import (
     DONE_SECONDS,
     ERROR_SECONDS,
     STRANDED_AFTER,
+    SUBAGENT_QUIET_GRACE,
     WORKING_LEASE,
     EventTail,
     _TERMINAL_EVENTS,
@@ -461,6 +462,53 @@ class BackendTest(unittest.TestCase):
             def send_packet(p): sent.append(p)
         light_backends.CapturedBackend(FakeKL()).send("success")
         self.assertEqual(sent, [b"rest"])
+
+
+class InterruptedTurnTest(unittest.TestCase):
+    """手动打断只发 SubagentStop、不发 Stop，跑马灯不能因此长跑。"""
+
+    def setUp(self):
+        self.m = StateMachine()
+
+    def at(self, t):
+        self.m.tick(t)
+        return self.m.effect(t)
+
+    def test_interrupt_returns_to_baseline_after_grace(self):
+        self.m.apply(ev("claude", "UserPromptSubmit", "S", T0))
+        self.m.apply(ev("claude", "PreToolUse", "S", T0 + 5))
+        # 打断：只有 SubagentStop，没有 Stop
+        self.m.apply(ev("claude", "SubagentStop", "S", T0 + 10, agent="sub"))
+        # 宽限期内仍然亮着，避免误杀刚好安静一下的真实工作
+        self.assertEqual(self.at(T0 + 10 + SUBAGENT_QUIET_GRACE - 1), "working-claude")
+        # 宽限期过后自动熄灭，不必等 30 分钟租约
+        self.assertEqual(self.at(T0 + 10 + SUBAGENT_QUIET_GRACE + 1), "baseline")
+
+    def test_work_continuing_past_a_subagent_renews_the_lease(self):
+        self.m.apply(ev("claude", "UserPromptSubmit", "S", T0))
+        self.m.apply(ev("claude", "SubagentStop", "S", T0 + 10, agent="sub"))
+        # 主会话继续干活 —— 真实子代理结束的情形
+        self.m.apply(ev("claude", "PreToolUse", "S", T0 + 12))
+        self.assertEqual(self.at(T0 + 10 + SUBAGENT_QUIET_GRACE + 5), "working-claude")
+
+    def test_grace_never_extends_a_shorter_lease(self):
+        self.m.apply(ev("claude", "UserPromptSubmit", "S", T0))
+        entry = self.m.sessions[("claude", "S", None)]
+        entry["expires"] = T0 + 5           # 已经快到期
+        self.m.apply(ev("claude", "SubagentStop", "S", T0 + 1, agent="sub"))
+        self.assertEqual(entry["expires"], T0 + 5)   # 没有被延长
+
+    def test_grace_does_not_touch_a_pending_approval(self):
+        self.m.apply(ev("claude", "PermissionRequest", "S", T0))
+        self.m.apply(ev("claude", "SubagentStop", "S", T0 + 1, agent="sub"))
+        # 紫灯不能被子代理退出掐掉
+        self.assertEqual(self.at(T0 + SUBAGENT_QUIET_GRACE + 10), "approval")
+
+    def test_normal_completion_is_unaffected(self):
+        self.m.apply(ev("claude", "UserPromptSubmit", "S", T0))
+        self.m.apply(ev("claude", "Stop", "S", T0 + 10))
+        self.m.apply(ev("claude", "SubagentStop", "S", T0 + 11, agent="sub"))
+        self.assertEqual(self.at(T0 + 12), "done")      # 绿灯照常
 
 
 if __name__ == "__main__":

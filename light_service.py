@@ -54,6 +54,14 @@ ADOPT_WINDOW = 30 * 60.0
 # Approval sessions are never touched: hiding a permission prompt is worse
 # than a stale marquee.
 STRANDED_AFTER = 120.0
+# Interrupting a turn fires SubagentStop with no Stop at all (measured
+# 2026-09-01: a completed turn logs Stop then SubagentStop, an interrupted one
+# logs only SubagentStop). SubagentStop must never mark the main session done
+# -- a real subagent finishing mid-turn would take the marquee with it -- so
+# instead it shortens the main session's lease to this grace window. Work that
+# is still going renews the lease within seconds, because every tool call
+# fires an event; an abandoned turn never does and quietly returns to idle.
+SUBAGENT_QUIET_GRACE = 45.0
 # Idle/registered sessions that stop producing events entirely are dropped.
 IDLE_PRUNE_AFTER = 6 * 60 * 60.0
 # Replayed on every start; truncated in place (never renamed — renaming is
@@ -214,6 +222,7 @@ class StateMachine:
             # Ends exactly one subagent. Never marks the main session done.
             if agent:
                 self.sessions.pop(target, None)
+            self._start_quiet_grace(main, now)
         elif name == "taskcompleted":
             # A sub-task finishing must never light the session-level green.
             entry = self.sessions.get(target)
@@ -249,6 +258,22 @@ class StateMachine:
             if key[0] == main[0] and key[1] == main[1] and key[2] is not None:
                 del self.sessions[key]
         self._drop_stale_siblings(main[0], main[1], now)
+
+    def _start_quiet_grace(
+        self, main: tuple[str, str, str | None], now: float
+    ) -> None:
+        """Shorten a still-working main session's lease to the grace window.
+
+        Only ever shortens, never extends, and only touches a session that is
+        actually "working" -- an approval must not be hidden by a subagent
+        exiting, and a session already done/idle has nothing to shorten.
+        """
+        entry = self.sessions.get(main)
+        if entry is None or entry.get("status") != "working":
+            return
+        grace = now + SUBAGENT_QUIET_GRACE
+        expires = entry.get("expires")
+        entry["expires"] = grace if expires is None else min(float(expires), grace)
 
     def _drop_stale_siblings(self, source: str, sid: str, now: float) -> None:
         """Stand down long-inactive working siblings when a session finishes.
