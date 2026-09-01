@@ -104,8 +104,16 @@ bug 修复（见下文「近期修复」），42 项测试锁着行为。本任�
 在官方驱动进程上挂抓包脚本（只观察写入，不修改任何数据）：
 
 ```powershell
-python .\tools\capture_hid_writes.py --pid <官方驱动的PID> --seconds 120
+# 先确认驱动 PID（进程名 "Machenike Gaming Keyboard"，重启后会变）
+Get-Process | Where-Object { $_.ProcessName -like '*Machenike*' } | Select-Object Id,ProcessName
+
+python .\tools\capture_hid_writes.py --pid <上面查到的PID> --seconds 120
 ```
+
+实测 2026-09-01 该进程存在且正在运行（当时 PID 14300），说明驱动装着、
+可以直接抓。抓包脚本挂的是 `WriteFile`，只过滤 64 字节且以 `01 07` 开头
+的写入——**如果「清除逐键」指令不以 `01 07` 开头，现有脚本会把它过滤掉**，
+需要临时放宽 `tools/capture_hid_writes.py` 里 `SCRIPT` 的过滤条件才能看到它。
 
 抓包期间在驱动里依次操作，**每步之间停 3~5 秒便于区分**：
 
