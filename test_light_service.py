@@ -377,5 +377,36 @@ class AmbiguousTerminalEventTest(unittest.TestCase):
         self.assertEqual(_TERMINAL_EVENTS, {"stop", "stopfailure", "sessionend"})
 
 
+class HidFailureReportingTest(unittest.TestCase):
+    """A keyboard this build cannot drive must be loud, not silent."""
+
+    def test_failures_are_counted_and_throttled(self):
+        logged = []
+        def always_fails(_packet):
+            raise RuntimeError("device unavailable")
+        r = Renderer(always_fails, logged.append)
+        for i in range(12):
+            r.render("working-codex", T0 + i)
+        self.assertEqual(r.consecutive_failures, 12)
+        self.assertIn("device unavailable", r.last_error or "")
+        # logged at the 1st and 10th failure only -- not 12 times
+        self.assertEqual(len(logged), 2)
+
+    def test_recovery_is_reported_and_resets(self):
+        logged = []
+        state = {"fail": True}
+        def flaky(_packet):
+            if state["fail"]:
+                raise RuntimeError("nope")
+        r = Renderer(flaky, logged.append)
+        r.render("working-codex", T0)
+        self.assertEqual(r.consecutive_failures, 1)
+        state["fail"] = False
+        r.render("working-claude", T0 + 1)
+        self.assertEqual(r.consecutive_failures, 0)
+        self.assertIsNone(r.last_error)
+        self.assertTrue(any("recovered" in m for m in logged))
+
+
 if __name__ == "__main__":
     unittest.main()

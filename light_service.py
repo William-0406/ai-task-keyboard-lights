@@ -360,6 +360,8 @@ class Renderer:
         self._log = log
         self._last_effect: str | None = None
         self._last_packet: str | None = None
+        self.consecutive_failures = 0
+        self.last_error: str | None = None
 
     def render(self, effect: str, now: float) -> float:
         packet, delay = packet_for(effect, now)
@@ -370,10 +372,26 @@ class Renderer:
             try:
                 self._send(packet)
                 self._last_packet = packet
+                if self.consecutive_failures:
+                    self._log(
+                        f"HID writes recovered after {self.consecutive_failures} failures"
+                    )
+                self.consecutive_failures = 0
+                self.last_error = None
                 if packet not in {"error", "off"}:  # keep the blink out of the log
                     self._log(f"effect={effect} -> sent {packet.upper()}")
             except Exception as exc:
-                self._log(f"effect={effect} -> HID write FAILED: {exc!r}")
+                self.consecutive_failures += 1
+                self.last_error = repr(exc)[:200]
+                # Log the first failure and then back off: a keyboard that is
+                # simply not there would otherwise write a line every 250ms.
+                if self.consecutive_failures in (1, 10, 100) or (
+                    self.consecutive_failures % 1000 == 0
+                ):
+                    self._log(
+                        f"effect={effect} -> HID write FAILED "
+                        f"(#{self.consecutive_failures}): {exc!r}"
+                    )
         return delay
 
 
@@ -446,12 +464,18 @@ def _service_log(message: str) -> None:
         pass
 
 
-def _write_snapshot(machine: StateMachine, now: float, started_at: float) -> None:
+def _write_snapshot(
+    machine: StateMachine,
+    now: float,
+    started_at: float,
+    extra: dict[str, Any] | None = None,
+) -> None:
     payload = {
         "pid": os.getpid(),
         "started_at": started_at,
         "written_at": now,
         **machine.snapshot(now),
+        **(extra or {}),
     }
     try:
         # The service runs outside every sandbox and is this file's only
@@ -568,6 +592,17 @@ def request_stop() -> bool:
 
 # --- the service loop ----------------------------------------------------
 
+def _health(kl: Any, renderer: "Renderer") -> dict[str, Any]:
+    """Device/write health, so `service status` can explain a dead keyboard."""
+    return {
+        "device": kl.DEVICE.key,
+        "device_name": kl.DEVICE.name,
+        "device_present": kl.device_present(),
+        "hid_failures": renderer.consecutive_failures,
+        "hid_last_error": renderer.last_error,
+    }
+
+
 def run_service(
     verbose: bool = False,
     stop_check: Callable[[], bool] | None = None,
@@ -599,6 +634,17 @@ def run_service(
     renderer = Renderer(send, report)
     started_at = time.time()
     report(f"service started pid={os.getpid()} device={kl.DEVICE.key}")
+    present = kl.device_present()
+    if not present:
+        # Without this the service looks perfectly healthy on a machine whose
+        # keyboard this build cannot drive: it starts, reports running, and
+        # quietly fails every write. Say it once, loudly, in the place people
+        # actually look, and keep it in the snapshot for `service status`.
+        report(
+            f"WARNING: no {kl.DEVICE.name} ({kl.DEVICE.hid_id}) is plugged in. "
+            f"The lights CANNOT work until a keyboard matching a profile in "
+            f"devices/ is present -- see README 'ver-devices'."
+        )
 
     replayed = replay_events(machine, tail)
     now = time.time()
@@ -616,7 +662,7 @@ def run_service(
             effect = machine.effect(now)
             delay = renderer.render(effect, now)
             if now - last_snapshot >= 2.0:
-                _write_snapshot(machine, now, started_at)
+                _write_snapshot(machine, now, started_at, _health(kl, renderer))
                 last_snapshot = now
             time.sleep(delay)
     except Exception as exc:
@@ -635,7 +681,7 @@ def run_service(
                 report(f"service exit: could not restore baseline: {exc!r}")
         else:
             report("service exit: active tasks remain, leaving lights as-is")
-        _write_snapshot(machine, time.time(), started_at)
+        _write_snapshot(machine, time.time(), started_at, _health(kl, renderer))
         if stop_signal is not None:
             stop_signal.close()
         kernel32.ReleaseMutex(mutex_handle)

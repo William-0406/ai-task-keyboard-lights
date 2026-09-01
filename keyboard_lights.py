@@ -270,15 +270,29 @@ def select_device(preferred: str | None = None) -> Device:
                 f"未知设备 '{preferred}'。可用：{', '.join(sorted(devices))}"
             )
         return devices[preferred]
-    if len(devices) > 1:
-        try:
-            paths = _enumerate_hid_paths()
-        except OSError:
-            paths = []
-        for device in devices.values():
-            if device.is_present(paths):
-                return device
+    try:
+        paths = _enumerate_hid_paths()
+    except OSError:
+        paths = []
+    for device in devices.values():
+        if device.is_present(paths):
+            return device
+    # Nothing plugged in matches any profile. Fall back to the first one so
+    # `devices` and `probe` still have something to talk about, but callers
+    # must not assume the keyboard is there -- ask device_present(). Skipping
+    # this check when only one profile exists is what made a fresh clone on
+    # any other keyboard fail silently: the service started, reported healthy,
+    # and wrote "HID write FAILED" to a log nobody was looking at.
     return next(iter(devices.values()))
+
+
+def device_present(device: "Device | None" = None) -> bool:
+    """True when the selected profile's keyboard is actually plugged in."""
+    target = device if device is not None else DEVICE
+    try:
+        return target.is_present(_enumerate_hid_paths())
+    except OSError:
+        return False
 
 
 def use_device(device: Device) -> None:
@@ -545,6 +559,18 @@ def service_status() -> int:
             print(f"快照读取失败：{exc}")
             snap = {}
         if snap:
+            present = snap.get("device_present")
+            name = snap.get("device_name") or snap.get("device") or "?"
+            if present is False:
+                print(f"** 键盘未插入：找不到 {name} —— 灯效不可能工作 **")
+                print("   跑 `probe` 看接口，或见 README「换设备：加一份设备配置」。")
+            elif present:
+                print(f"键盘：{name}（已插入）")
+            failures = snap.get("hid_failures") or 0
+            if failures:
+                print(f"** 连续 {failures} 次 HID 写入失败 **")
+                if snap.get("hid_last_error"):
+                    print(f"   最后一次错误：{snap['hid_last_error']}")
             written = float(snap.get("written_at", 0.0))
             started = float(snap.get("started_at", 0.0))
             print(
