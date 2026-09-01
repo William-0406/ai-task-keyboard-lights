@@ -6,7 +6,7 @@
 | --- | --- |
 | Codex 执行中 | 蓝色跑马灯 |
 | Claude 执行中 | 橙色跑马灯 |
-| 两边同时执行 | 蓝橙每 2 秒交替 |
+| 两边同时执行 | 蓝橙交替（默认 5 秒，见 `BOTH_ALTERNATE_SECONDS`）|
 | 任务成功 | 绿色常亮 10 秒 |
 | 等待你确认 | 紫色呼吸灯 |
 | 会话失败 | 红色急闪 10 秒 |
@@ -47,9 +47,48 @@ if packet[0] != 0x01 or packet[1] != 0x07 or packet[2:6] != b"\x00\x00\x00\x0e":
 python .\keyboard_lights.py devices          # 列出可用的键盘配置
 python .\keyboard_lights.py probe            # 只检测设备，不改灯
 python .\keyboard_lights.py show claude --seconds 3
+python .\install_hooks.py                    # 安装 Hook（只追加事件）
+python .\keyboard_lights.py service install  # 注册登录自启
+python .\keyboard_lights.py service start    # 立即启动统一灯效服务
 python .\keyboard_lights.py simulate claude  # 完整重放一次会话
-python .\install_hooks.py                    # 安装 Hook
 ```
+
+## 架构：统一灯效服务
+
+```text
+Codex Hook  ─┐
+             ├─ 追加事件 ─> events.jsonl ─> 唯一 Windows 灯效服务 ─> HID 键盘
+Claude Hook ─┘                          │
+                                        ├─ 内存状态机
+                                        ├─ service-state.json（只读快照，诊断用）
+                                        └─ service.log
+```
+
+Hook 进程只做一件事：把事件标准化成一行 JSON 追加到
+`%LOCALAPPDATA%\MachenikeTaskLights\events.jsonl`，然后退出。它**不写 HID、
+不启动任何后台进程、不读共享状态做决策**。
+
+所有决策都在一个常驻的灯效服务里：它持有唯一的 HID 写入权和一个 Windows
+命名互斥量（第二个实例启动即退出），在内存里维护全部会话状态，按优先级
+`error > approval > done > working > baseline` 合成唯一灯效。绿色/红色 10 秒
+到期后重新计算全局状态并**重发**恢复包——不是无条件回基线。
+
+**为什么要这样**：Codex 和 Claude 的桌面应用会把 Hook 跑在各自的沙箱里，同一
+路径的可变状态文件在两个沙箱里是两份私有副本（实测同一 `state.json` 两侧
+inode 不同），任何依赖共享可变文件做决策的方案都会互相覆盖。唯一实测能穿透
+两个沙箱的写入模式是**对已存在文件的追加**，因此事件用追加日志传递，状态机
+放进沙箱之外的常驻服务。
+
+其他规则：
+
+- 主会话键是 `(source, session_id)`，子代理另有独立键；`SubagentStop` 和
+  `TaskCompleted` 都绝不会结束主会话或点亮整会话绿灯。
+- 一个会话结束**只**清除它自己（及其子代理），同来源的其他任务不受影响。
+- `working` 状态带 30 分钟租约，由活动事件（每次工具调用）续期；agent 崩溃
+  不会留下永久跑马灯。
+- 重复 `event_id` 只处理一次；损坏的 JSON 行记日志后跳过；服务重启时重放
+  事件日志，恢复所有未过期的会话。
+- 事件行不含提示词、工具参数、回答正文；`cwd` 只记哈希。
 
 ## 三种接入方式
 
@@ -159,37 +198,47 @@ python .\watch_cowork.py --replay <文件> --dry-run   # 离线验证映射逻�
 > ⚠️ transcript 是内部格式，没有兼容性承诺。失效时改
 > `watch_cowork.py` 里的 `SessionState.observe()`。
 
-## 排查
+## 服务管理与排查
 
 ```powershell
-python .\keyboard_lights.py status              # daemon 心跳、当前状态、日志尾部
-python .\keyboard_lights.py stop                # 清状态 + 强杀残留 daemon + 恢复基线
-python .\keyboard_lights.py simulate claude     # 走真实 Hook 路径重放一次会话
-python .\keyboard_lights.py simulate claude --inline   # 灯光循环跑前台，打印每次 HID 写入
-python .\diagnose.py                            # 检查 Hook 装没装、模拟一次调用
+python .\keyboard_lights.py service status      # 服务 PID、活动会话、当前灯效、日志尾部
+python .\keyboard_lights.py service start       # 启动（优先走计划任务/启动项，沙箱外）
+python .\keyboard_lights.py service stop        # 停止服务（按 PID + 完整命令行精确核对）
+python .\keyboard_lights.py service install     # 注册登录自启（计划任务被拒时写启动文件夹）
+python .\keyboard_lights.py service uninstall   # 移除自启并停止服务
+python .\keyboard_lights.py stop                # 停服务 + 清理旧版 daemon + 恢复基线
+python .\keyboard_lights.py simulate claude     # 走真实事件管道重放一次会话
+python .\keyboard_lights.py simulate claude --inline   # 服务循环跑前台，打印每次 HID 写入
+python .\diagnose.py                            # 检查 Hook / 服务 / 事件追加是否都通
+python -m unittest test_light_service           # 状态机单元测试（不碰键盘）
 ```
 
 `simulate` 不需要 AI 参与、不消耗额度，额度用尽时也能验证。
-`--inline` 与普通模式的唯一差别是「灯光循环在不在独立进程里」，
-用来区分**状态机/灯效指令的问题**和**分离进程的问题**。
+`--inline` 用来区分**状态机的问题**和**服务生命周期的问题**。
 
-日志位置：`%LOCALAPPDATA%\MachenikeTaskLights\keyboard-lights.log`
+数据目录：`%LOCALAPPDATA%\MachenikeTaskLights\`
+（`events.jsonl` 事件日志、`service.log` 服务日志、`service-state.json` 只读快照）
 
-### 已知失效模式：daemon 卡死
+### 两个安装时会踩的坑
 
-灯光由一个后台 daemon 轮询状态文件驱动，单实例靠命名互斥量保证。
+**Codex 的 hook 命令必须以 `&` 开头。** Codex 用 PowerShell 执行 shell 形式的 hook，
+而 PowerShell 里一条以引号路径开头的命令只是个字符串表达式——不加 `&` 调用运算符，
+它会抛解析错误、**不启动任何进程**，但整体仍然返回成功。于是 hook 装好了、信任也点了，
+却一次都没执行过，而且没有任何地方会报错。安装器已经会自动加上，手写配置时别漏：
 
-早期版本只检查互斥量有没有被占用，**不检查持有者是否还活着**。一旦某个 daemon 卡死
-（对 HID 设备的同步 `WriteFile` 没有超时，设备不收就会永久阻塞），它会一直攥着互斥量，
-此后每个新 daemon 启动即自杀——**灯从此永久不亮，且没有任何报错**。
+```
+& "C:/Python314/python.exe" "C:/.../keyboard_lights.py" hook codex PreToolUse
+```
 
-现在有两道防线：
+**hook payload 必须按 UTF-8 解码，不能用控制台代码页。** Windows 给管道 stdin 的默认
+编码是系统 ANSI 代码页（中文系统是 gbk），而 hook payload 是 UTF-8 JSON。仓库路径带
+非 ASCII 字符时，UTF-8 字节按 gbk 解出来会撞出 `\`，JSON 转义当场崩掉，整个 payload
+解析失败、`session_id` 丢失——症状是**只有装在中文路径下的项目会乱**，而且要多个项目
+同时跑才看得出来。`light_client.py` 现在读二进制再显式按 UTF-8 解码。
 
-1. daemon 每 2 秒写一次心跳。互斥量被占但心跳超过 8 秒未更新时，新 daemon 判定持有者
-   已死并接管。
-2. 没有活着的 daemon 时，Hook 进程自己直接发灯效指令，daemon 机制整体瘫痪也不影响提示。
-
-`status` 会把卡死的 daemon 明确标出来，`stop` 可以强杀。
+灯不动时按顺序看三样：`service status` 显示服务在不在跑；`events.jsonl`
+最近有没有追加（没有 = Hook 没触发，多半是 Codex `/hooks` 信任没点）；
+`service.log` 里 HID 写入有没有报错。
 
 ## 换设备：加一份设备配置
 
@@ -246,9 +295,12 @@ $env:KEYBOARD_LIGHTS_DEVICE = "k500-m81"                 # 或用环境变量
 
 | 文件 | 作用 |
 | --- | --- |
-| `keyboard_lights.py` | 主程序：HID 写入、状态机、后台 daemon、CLI |
+| `keyboard_lights.py` | HID 写入、设备配置、CLI、服务管理命令 |
+| `light_client.py` | Hook 客户端：把事件追加到 `events.jsonl` 后立即退出 |
+| `light_service.py` | 统一灯效服务：内存状态机 + 事件重放/尾随 + 渲染 |
+| `test_light_service.py` | 状态机与事件管道的单元测试（mock HID） |
 | `install_hooks.py` | 合并/移除 Codex 与 Claude Code 的 Hook 配置 |
-| `watch_cowork.py` | Transcript 监听器（无 Hook 场景的备选） |
+| `watch_cowork.py` | Transcript 监听器（无 Hook 场景的备选，同样只追加事件） |
 | `diagnose.py` | 端到端诊断 |
 | `tools/capture_hid_writes.py` | 从官方驱动抓灯光指令 |
 | `devices/*.json` | 各型号的 VID/PID 与灯效指令（加键盘=加文件） |

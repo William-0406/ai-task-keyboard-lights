@@ -43,6 +43,7 @@ CLAUDE_EVENTS = (
     "PostToolUse",
     "PostToolUseFailure",
     "PermissionRequest",
+    "PermissionDenied",
     "Notification",
     "Elicitation",
     "TaskCompleted",
@@ -181,11 +182,20 @@ def _load(path: Path) -> dict[str, Any]:
 
 
 def _command(source: str, event: str) -> str:
-    # Quote both paths: either can contain spaces (Program Files) or
-    # non-ASCII characters, and shell-form hooks get tokenized by a shell.
+    """Build the shell-form command Codex runs for one hook event.
+
+    The leading & is the PowerShell call operator and is load-bearing: Codex
+    executes shell-form hooks through PowerShell, where a command beginning
+    with a quoted path is merely a string expression. Without &, PowerShell
+    raises a parse error, no process is ever started, and the hook still
+    reports success -- measured 2026-09-01, the hooks had been installed and
+    trusted for days without executing even once, and nothing surfaced an
+    error. Quote both paths too: either can contain spaces (Program Files) or
+    non-ASCII characters, and shell-form hooks get tokenized by a shell.
+    """
     python = Path(sys.executable).resolve().as_posix()
     controller = CONTROLLER.as_posix()
-    return f'"{python}" "{controller}" hook {source} {event}'
+    return f'& "{python}" "{controller}" hook {source} {event}'
 
 
 def _timeout(source: str, event: str) -> int:

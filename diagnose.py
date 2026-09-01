@@ -22,8 +22,9 @@ CODEX_SETTINGS = Path.home() / ".codex" / "hooks.json"
 CODEX_TOML = Path.home() / ".codex" / "config.toml"
 CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"
 APP_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "MachenikeTaskLights"
-STATE_FILE = APP_DIR / "state.json"
-LOG_FILE = APP_DIR / "keyboard-lights.log"
+EVENTS_FILE = APP_DIR / "events.jsonl"
+SNAPSHOT_FILE = APP_DIR / "service-state.json"
+SERVICE_LOG = APP_DIR / "service.log"
 MARKER = "keyboard_lights.py"
 
 OK = "  [OK]  "
@@ -134,37 +135,52 @@ def check_codex_trust() -> None:
             print(f"{BAD}config.toml 里也有 [hooks] 表 —— 与 hooks.json 同层会被合并并告警，建议只留一种")
 
 
-def check_state_and_log() -> None:
-    section("4. 运行痕迹")
+def check_service() -> None:
+    section("4. 统一灯效服务")
     print(f"{INFO}状态目录 = {APP_DIR}")
-    if STATE_FILE.exists():
-        try:
-            state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-            age = time.time() - STATE_FILE.stat().st_mtime
-            print(f"{OK}state.json 存在，{age:.0f} 秒前更新过")
-            print(f"{INFO}generation = {state.get('generation')}, sessions = {len(state.get('sessions', {}))}")
-            for key, item in list(state.get("sessions", {}).items())[:5]:
-                print(f"{INFO}  {key} -> status={item.get('status')} event={item.get('event')}")
-        except (OSError, json.JSONDecodeError) as exc:
-            print(f"{BAD}state.json 读取失败：{exc}")
-    else:
-        print(f"{BAD}state.json 不存在 —— hook 从来没被真正执行过一次")
+    try:
+        sys.path.insert(0, str(ROOT))
+        import light_service
 
-    if LOG_FILE.exists():
-        lines = LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
-        print(f"{INFO}日志 {len(lines)} 行，最后 10 行：")
+        running = light_service.service_mutex_held()
+    except Exception as exc:
+        print(f"{BAD}无法检查服务互斥量：{exc!r}")
+        running = None
+    if running is True:
+        print(f"{OK}服务在运行（互斥量被持有）")
+    elif running is False:
+        print(f"{BAD}服务没在运行 —— 跑 python .\\keyboard_lights.py service start")
+
+    if SNAPSHOT_FILE.exists():
+        try:
+            snap = json.loads(SNAPSHOT_FILE.read_text(encoding="utf-8"))
+            age = time.time() - float(snap.get("written_at", 0.0))
+            print(f"{OK}快照存在，{age:.0f} 秒前写入，effect={snap.get('effect')}，"
+                  f"sessions={len(snap.get('sessions') or [])}")
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            print(f"{BAD}service-state.json 读取失败：{exc}")
+    else:
+        print(f"{INFO}还没有 service-state.json（服务从未启动过）")
+
+    if EVENTS_FILE.exists():
+        age = time.time() - EVENTS_FILE.stat().st_mtime
+        print(f"{OK}events.jsonl 存在（{EVENTS_FILE.stat().st_size} 字节，{age:.0f} 秒前有追加）")
+    else:
+        print(f"{BAD}events.jsonl 不存在 —— hook 从来没被真正执行过一次")
+
+    if SERVICE_LOG.exists():
+        lines = SERVICE_LOG.read_text(encoding="utf-8", errors="replace").splitlines()
+        print(f"{INFO}service.log 最后 10 行：")
         for line in lines[-10:]:
             print(f"        {line}")
-    else:
-        print(f"{INFO}没有日志文件（只有 HID 写入失败才会写日志，没有不一定是坏事）")
 
 
 def simulate_hook() -> None:
-    section("5. 模拟一次 hook 调用（这一步会真的改灯）")
+    section("5. 模拟一次 hook 调用（服务在跑的话，这一步会真的改灯）")
     payload = json.dumps(
         {"session_id": "diagnose-probe", "hook_event_name": "PreToolUse", "cwd": str(ROOT)}
     )
-    before = STATE_FILE.stat().st_mtime if STATE_FILE.exists() else 0.0
+    before = EVENTS_FILE.stat().st_size if EVENTS_FILE.exists() else 0
     cmd = [sys.executable, str(CONTROLLER), "hook", "claude", "PreToolUse"]
     print(f"{INFO}执行：{' '.join(cmd)}")
     try:
@@ -175,69 +191,28 @@ def simulate_hook() -> None:
         print(f"{BAD}超时 —— hook 进程卡住了（很可能卡在读 stdin）")
         return
     print(f"{INFO}exit={result.returncode}")
-    if result.stdout.strip():
-        print(f"{INFO}stdout: {result.stdout.strip()[:300]}")
     if result.stderr.strip():
         print(f"{BAD}stderr: {result.stderr.strip()[:600]}")
     if result.returncode != 0:
-        print(f"{BAD}hook 脚本本身就跑不通，先修这个")
+        print(f"{BAD}hook 客户端本身就跑不通，先修这个")
         return
 
-    time.sleep(2.5)
-    if not STATE_FILE.exists():
-        print(f"{BAD}state.json 仍未生成 —— record_event 没写成功")
-        return
-    after = STATE_FILE.stat().st_mtime
+    after = EVENTS_FILE.stat().st_size if EVENTS_FILE.exists() else 0
     if after > before:
-        print(f"{OK}state.json 已更新 —— hook -> 状态写入 这一环是通的")
+        print(f"{OK}events.jsonl 增长了 {after - before} 字节 —— hook -> 事件追加 这一环是通的")
     else:
-        print(f"{BAD}state.json 没变化")
+        print(f"{BAD}events.jsonl 没变化 —— 事件没写进去")
+        return
 
-    running = _daemon_running()
-    if running is None:
-        print(f"{INFO}无法枚举进程，跳过 daemon 检查")
-    elif running:
-        print(f"{OK}后台 daemon 进程已拉起 —— 灯这会儿应该在动")
-    else:
-        print(f"{BAD}daemon 没起来 —— 状态写进去了但没人去刷灯，问题在 _start_daemon")
-
-    print()
-    print(f"{INFO}5 秒后恢复基线灯效…")
-    time.sleep(5)
+    print(f"{INFO}3 秒后发 SessionEnd 清理…")
+    time.sleep(3)
     subprocess.run(
         [sys.executable, str(CONTROLLER), "hook", "claude", "SessionEnd"],
         input=json.dumps({"session_id": "diagnose-probe"}),
         capture_output=True,
         text=True,
     )
-    subprocess.run([sys.executable, str(CONTROLLER), "restore"], capture_output=True)
-    print(f"{OK}已恢复")
-
-
-def _daemon_running() -> bool | None:
-    try:
-        out = subprocess.run(
-            ["wmic", "process", "get", "CommandLine"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        ).stdout
-    except (OSError, subprocess.TimeoutExpired):
-        try:
-            out = subprocess.run(
-                [
-                    "powershell",
-                    "-NoProfile",
-                    "-Command",
-                    "Get-CimInstance Win32_Process | Select-Object -ExpandProperty CommandLine",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=25,
-            ).stdout
-        except (OSError, subprocess.TimeoutExpired):
-            return None
-    return "_daemon" in (out or "")
+    print(f"{OK}已发送 SessionEnd（服务会自行恢复灯效）")
 
 
 def main() -> int:
@@ -246,7 +221,7 @@ def main() -> int:
     codex = check_settings(CODEX_SETTINGS, "Codex")
     claude = check_settings(CLAUDE_SETTINGS, "Claude Code")
     check_codex_trust()
-    check_state_and_log()
+    check_service()
     simulate_hook()
 
     section("结论速览")
